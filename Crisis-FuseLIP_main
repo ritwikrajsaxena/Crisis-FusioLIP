@@ -1,0 +1,1298 @@
+# =============================================================================
+# UNIFIED MULTIMODAL DISASTER CLASSIFICATION PIPELINE
+# 3 Encoders × 3 Fusion Methods × 3 Tasks × 5 Seeds × 5 HP Configs = 675 Runs
+# =============================================================================
+
+# ── IMPORTS ──────────────────────────────────────────────────────────────────
+import gc
+import os
+import sys
+import math
+import random
+import warnings
+from collections import Counter
+from typing import Dict, List, Tuple, Optional
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+from PIL import Image
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.cuda.amp import autocast, GradScaler
+
+import torchvision.transforms as transforms
+from transformers import (
+    CLIPModel, CLIPTokenizer,
+    BlipModel, AutoTokenizer,
+    SiglipModel, SiglipProcessor,
+)
+from sklearn.metrics import f1_score, accuracy_score
+
+warnings.filterwarnings('ignore')
+import transformers
+transformers.logging.set_verbosity_error()
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+# ── Paths ────────────────────────────────────────────────────────────────────
+BASE_DIR = "/home/rsnfh/Downloads/CrisisMMD_v2.0"
+SPLITS_DIR = os.path.join(BASE_DIR, "crisismmd_datasplit_with_LLaVA_generated_text")
+RESULTS_DIR = os.path.join(BASE_DIR, "experiment_results")
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+# ── Task Definitions ─────────────────────────────────────────────────────────
+TASKS = {
+    'informativeness': {
+        'prefix': 'task_informative_text_img',
+        'label_map': {'not_informative': 0, 'informative': 1},
+    },
+    'humanitarian': {
+        'prefix': 'task_humanitarian_text_img',
+        'label_map': {
+            'affected_individuals': 0, 'infrastructure_and_utility_damage': 1,
+            'injured_or_dead_people': 2, 'missing_or_found_people': 3,
+            'not_humanitarian': 4, 'other_relevant_information': 5,
+            'rescue_volunteering_or_donation_effort': 6, 'vehicle_damage': 7
+        },
+    },
+    'damage': {
+        'prefix': 'task_damage_text_img',
+        'label_map': {'little_or_no_damage': 0, 'mild_damage': 1, 'severe_damage': 2},
+    }
+}
+
+# ── Encoder Configurations ───────────────────────────────────────────────────
+ENCODER_CONFIGS = {
+    'clip': {
+        'model_name': "openai/clip-vit-base-patch32",
+        'vision_dim': 768,
+        'text_dim': 512,
+        'max_length': 77,
+        'lora_targets': ['q_proj', 'k_proj', 'v_proj', 'out_proj'],
+    },
+    'blip': {
+        'model_name': "Salesforce/blip-itm-base-coco",
+        'vision_dim': 768,
+        'text_dim': 768,
+        'max_length': 128,
+        'lora_targets': ['query', 'key', 'value', 'dense', 'self'],
+    },
+    'siglip': {
+        'model_name': "google/siglip-base-patch16-224",
+        'vision_dim': 768,
+        'text_dim': 768,
+        'max_length': 64,
+        'lora_targets': ['q_proj', 'k_proj', 'v_proj', 'out_proj'],
+    },
+}
+
+# ── Fusion Methods ───────────────────────────────────────────────────────────
+FUSION_METHODS = ['cca', 'gated', 'cross_attention']
+
+# ── Seeds ────────────────────────────────────────────────────────────────────
+SEEDS = [42, 123, 456, 789, 1024]
+
+# ── Hyperparameter Configurations (5 trials) ─────────────────────────────────
+HP_CONFIGS = [
+    {'lora_rank': 4,  'lora_alpha': 8,   'lora_dropout': 0.30,
+     'backbone_lr': 4e-5,   'head_lr': 5e-4},
+    {'lora_rank': 12, 'lora_alpha': 24,  'lora_dropout': 0.35,
+     'backbone_lr': 3.5e-5, 'head_lr': 5e-4},
+    {'lora_rank': 24, 'lora_alpha': 48,  'lora_dropout': 0.40,
+     'backbone_lr': 3e-5,   'head_lr': 4e-4},
+    {'lora_rank': 40, 'lora_alpha': 80,  'lora_dropout': 0.40,
+     'backbone_lr': 2.5e-5, 'head_lr': 4e-4},
+    {'lora_rank': 56, 'lora_alpha': 112, 'lora_dropout': 0.45,
+     'backbone_lr': 2e-5,   'head_lr': 3e-4},
+]
+
+# ── Training Settings ────────────────────────────────────────────────────────
+EPOCHS_PER_TRIAL = 7
+PATIENCE = 2
+BATCH_SIZE = 16
+GRAD_ACCUM = 2
+CCA_WEIGHT = 0.10  # Fixed, not optimized
+
+# =============================================================================
+# UTILITIES
+# =============================================================================
+
+def set_seed(seed: int):
+    """Set random seed for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def cleanup():
+    """Aggressive CUDA memory cleanup."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+
+def cleanup_aggressive():
+    """Even more aggressive cleanup for encoder switching."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        # Force garbage collection of CUDA tensors
+        for obj in gc.get_objects():
+            try:
+                if torch.is_tensor(obj) and obj.is_cuda:
+                    del obj
+            except:
+                pass
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+def get_device():
+    """Get compute device with info."""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if torch.cuda.is_available():
+        print(f"Device: {device}")
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    return device
+
+
+DEVICE = get_device()
+
+# =============================================================================
+# DATASET
+# =============================================================================
+
+class CrisisMMDDataset(Dataset):
+    """Unified dataset for all encoders."""
+    
+    def __init__(self, task_name: str, split: str, transform, 
+                 tokenizer, max_length: int, encoder_name: str):
+        self.task = TASKS[task_name]
+        self.transform = transform
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.encoder_name = encoder_name
+        self.samples = []
+        
+        tsv_path = os.path.join(SPLITS_DIR, f"{self.task['prefix']}_{split}.tsv")
+        df = pd.read_csv(tsv_path, sep='\t', on_bad_lines='skip')
+        
+        for _, row in df.iterrows():
+            img_rel = row.get('image', '')
+            if pd.isna(img_rel) or img_rel == '':
+                continue
+            img_path = os.path.join(BASE_DIR, img_rel)
+            if not os.path.exists(img_path):
+                continue
+            
+            tweet = str(row.get('tweet_text', '')) if pd.notna(row.get('tweet_text')) else ''
+            llava = str(row.get('LLaVA_text', '')) if pd.notna(row.get('LLaVA_text')) else ''
+            text = (tweet.strip() + ' ' + llava.strip()).strip()
+            if not text:
+                continue
+            
+            label_str = str(row.get('label', '')).strip()
+            if label_str not in self.task['label_map']:
+                continue
+            
+            self.samples.append({
+                'image_path': img_path,
+                'text': text,
+                'label': self.task['label_map'][label_str]
+            })
+    
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        s = self.samples[idx]
+        
+        # Load image
+        try:
+            img = Image.open(s['image_path']).convert('RGB')
+            img = self.transform(img)
+        except Exception:
+            img = torch.zeros(3, 224, 224)
+        
+        # Tokenize text
+        if self.encoder_name == 'siglip':
+            enc = self.tokenizer.tokenizer(
+                s['text'], padding='max_length', max_length=self.max_length,
+                truncation=True, return_tensors='pt'
+            )
+            input_ids = enc['input_ids'].squeeze(0)
+            pad_id = self.tokenizer.tokenizer.pad_token_id or 1
+            attention_mask = (input_ids != pad_id).long()
+        else:
+            enc = self.tokenizer(
+                s['text'], padding='max_length', max_length=self.max_length,
+                truncation=True, return_tensors='pt'
+            )
+            input_ids = enc['input_ids'].squeeze(0)
+            attention_mask = enc['attention_mask'].squeeze(0)
+        
+        return {
+            'image': img,
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'label': torch.tensor(s['label'], dtype=torch.long)
+        }
+
+
+def get_transforms(split: str):
+    """Get image transforms for training/evaluation."""
+    mean = (0.48145466, 0.4578275, 0.40821073)
+    std = (0.26862954, 0.26130258, 0.27577711)
+    
+    if split == 'train':
+        return transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ColorJitter(0.2, 0.2, 0.2, 0.1),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ])
+    return transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std),
+    ])
+
+
+def get_tokenizer(encoder_name: str):
+    """Get tokenizer for encoder."""
+    config = ENCODER_CONFIGS[encoder_name]
+    if encoder_name == 'clip':
+        return CLIPTokenizer.from_pretrained(config['model_name'])
+    elif encoder_name == 'blip':
+        return AutoTokenizer.from_pretrained(config['model_name'])
+    elif encoder_name == 'siglip':
+        return SiglipProcessor.from_pretrained(config['model_name'])
+    else:
+        raise ValueError(f"Unknown encoder: {encoder_name}")
+
+
+def make_loaders(task_name: str, encoder_name: str, batch_size: int = 16):
+    """Create data loaders for a task-encoder combination."""
+    config = ENCODER_CONFIGS[encoder_name]
+    tokenizer = get_tokenizer(encoder_name)
+    
+    datasets = {}
+    for split in ['train', 'dev', 'test']:
+        datasets[split] = CrisisMMDDataset(
+            task_name, split, 
+            get_transforms(split if split == 'train' else 'val'),
+            tokenizer, config['max_length'], encoder_name
+        )
+    
+    loaders = {
+        'train': DataLoader(datasets['train'], batch_size=batch_size, 
+                           shuffle=True, num_workers=0, pin_memory=False, drop_last=True),
+        'val': DataLoader(datasets['dev'], batch_size=batch_size,
+                         shuffle=False, num_workers=0, pin_memory=False),
+        'test': DataLoader(datasets['test'], batch_size=batch_size,
+                          shuffle=False, num_workers=0, pin_memory=False),
+    }
+    
+    # Dynamic num_classes
+    num_classes = len(TASKS[task_name]['label_map'])
+    
+    return loaders, datasets['train'], num_classes
+
+# =============================================================================
+# LOSS FUNCTIONS
+# =============================================================================
+
+class FocalLoss(nn.Module):
+    """Focal loss for imbalanced classification (humanitarian task)."""
+    
+    def __init__(self, weight: Optional[torch.Tensor] = None, gamma: float = 2.0):
+        super().__init__()
+        self.weight = weight
+        self.gamma = gamma
+    
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce)
+        focal = ((1 - pt) ** self.gamma) * ce
+        if self.weight is not None:
+            w = self.weight.to(inputs.device)
+            focal = w.gather(0, targets) * focal
+        return focal.mean()
+
+
+class WeightedCE(nn.Module):
+    """Weighted cross-entropy loss."""
+    
+    def __init__(self, weight: Optional[torch.Tensor] = None):
+        super().__init__()
+        self.weight = weight
+    
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        w = self.weight.to(inputs.device) if self.weight is not None else None
+        return F.cross_entropy(inputs, targets, weight=w)
+
+
+def compute_class_weights(train_dataset, num_classes: int) -> torch.Tensor:
+    """Compute inverse-frequency class weights."""
+    labels = [s['label'] for s in train_dataset.samples]
+    counts = Counter(labels)
+    total = len(labels)
+    
+    weights = torch.zeros(num_classes)
+    for c in range(num_classes):
+        weights[c] = total / (num_classes * counts.get(c, 1))
+    weights = weights / weights.mean()
+    
+    return weights
+
+
+def build_loss_fn(task_name: str, train_dataset, num_classes: int):
+    """Build appropriate loss function for task."""
+    class_weights = compute_class_weights(train_dataset, num_classes)
+    
+    if task_name == 'humanitarian':
+        return FocalLoss(weight=class_weights, gamma=2.0)
+    else:
+        return WeightedCE(weight=class_weights)
+
+# =============================================================================
+# LORA IMPLEMENTATION
+# =============================================================================
+
+class LoRALayer(nn.Module):
+    """Low-Rank Adaptation layer."""
+    
+    def __init__(self, original: nn.Linear, rank: int, alpha: int, dropout: float):
+        super().__init__()
+        self.original = original
+        self.scaling = alpha / rank
+        
+        # Freeze original weights
+        for p in self.original.parameters():
+            p.requires_grad = False
+        
+        # LoRA matrices
+        self.lora_A = nn.Linear(original.in_features, rank, bias=False)
+        self.lora_B = nn.Linear(rank, original.out_features, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        
+        # Initialization
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+    
+    @property
+    def weight(self):
+        return self.original.weight
+    
+    @property
+    def bias(self):
+        return self.original.bias
+    
+    @property
+    def in_features(self):
+        return self.original.in_features
+    
+    @property
+    def out_features(self):
+        return self.original.out_features
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.original(x) + self.scaling * self.lora_B(
+            self.lora_A(self.dropout(x)))
+    
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            if 'original' in self.__dict__:
+                return getattr(self.original, name)
+            raise
+
+
+def apply_lora(model: nn.Module, targets: List[str], 
+               rank: int, alpha: int, dropout: float) -> Tuple[nn.Module, int]:
+    """Apply LoRA to specified layers in model."""
+    count = 0
+    for name, module in list(model.named_modules()):
+        if any(t in name for t in targets) and isinstance(module, nn.Linear):
+            parts = name.split('.')
+            parent = model
+            for part in parts[:-1]:
+                parent = getattr(parent, part)
+            setattr(parent, parts[-1], LoRALayer(module, rank, alpha, dropout))
+            count += 1
+    return model, count
+
+# =============================================================================
+# FUSION METHODS
+# =============================================================================
+
+class CCAFusion(nn.Module):
+    """
+    Canonical Correlation Analysis fusion.
+    Adapts to asymmetric dimensions (e.g., CLIP: 768/512).
+    """
+    
+    def __init__(self, vision_dim: int, text_dim: int, projection_dim: int = 512,
+                 lambda_l2: float = 1e-4, mu_orth: float = 0.01, eps: float = 1e-6):
+        super().__init__()
+        self.projection_dim = projection_dim
+        self.lambda_l2 = lambda_l2
+        self.mu_orth = mu_orth
+        self.eps = eps
+        
+        # Projection matrices (handle asymmetric dims)
+        self.W_cca_v = nn.Linear(vision_dim, projection_dim, bias=False)
+        self.W_cca_t = nn.Linear(text_dim, projection_dim, bias=False)
+        
+        # Orthogonal initialization
+        nn.init.orthogonal_(self.W_cca_v.weight)
+        nn.init.orthogonal_(self.W_cca_t.weight)
+        
+        # LayerNorm for stability
+        self.norm_v = nn.LayerNorm(projection_dim)
+        self.norm_t = nn.LayerNorm(projection_dim)
+        
+        self.output_dim = 2 * projection_dim
+    
+    def forward(self, vision_feat: torch.Tensor, text_feat: torch.Tensor) -> torch.Tensor:
+        hv = self.norm_v(self.W_cca_v(vision_feat))
+        ht = self.norm_t(self.W_cca_t(text_feat))
+        return torch.cat([ht, hv], dim=-1)
+    
+    def compute_cca_loss(self, vision_feat: torch.Tensor, 
+                         text_feat: torch.Tensor) -> Dict[str, torch.Tensor]:
+        hv = self.W_cca_v(vision_feat)
+        ht = self.W_cca_t(text_feat)
+        
+        B = hv.size(0)
+        
+        # Per-dimension Pearson correlation
+        hv_c = hv - hv.mean(dim=0, keepdim=True)
+        ht_c = ht - ht.mean(dim=0, keepdim=True)
+        
+        cov = (hv_c * ht_c).sum(dim=0) / (B - 1 + self.eps)
+        var_v = (hv_c ** 2).sum(dim=0) / (B - 1 + self.eps)
+        var_t = (ht_c ** 2).sum(dim=0) / (B - 1 + self.eps)
+        
+        std_v = torch.sqrt(var_v + self.eps)
+        std_t = torch.sqrt(var_t + self.eps)
+        
+        corr_per_dim = cov / (std_v * std_t)
+        mean_corr = corr_per_dim.mean()
+        
+        # L2 regularization
+        l2_reg = (torch.norm(self.W_cca_v.weight, p='fro') ** 2 +
+                  torch.norm(self.W_cca_t.weight, p='fro') ** 2)
+        
+        loss_cca = -mean_corr + self.lambda_l2 * l2_reg
+        
+        # Orthogonality constraint
+        Wv = self.W_cca_v.weight
+        Wt = self.W_cca_t.weight
+        I = torch.eye(self.projection_dim, device=Wv.device, dtype=Wv.dtype)
+        
+        loss_orth = (torch.norm(Wv @ Wv.T - I, p='fro') ** 2 +
+                     torch.norm(Wt @ Wt.T - I, p='fro') ** 2)
+        
+        loss_aux = loss_cca + self.mu_orth * loss_orth
+        
+        return {
+            'loss_aux': loss_aux,
+            'loss_cca': loss_cca.detach(),
+            'loss_orth': loss_orth.detach(),
+            'mean_corr': mean_corr.detach(),
+        }
+
+
+class GatedFusion(nn.Module):
+    """
+    Cross-modal gated fusion.
+    Adapts to asymmetric dimensions.
+    """
+    
+    def __init__(self, vision_dim: int, text_dim: int, 
+                 hidden_dim: int = 512, dropout: float = 0.1):
+        super().__init__()
+        
+        # Gate networks
+        self.vision_gate = nn.Sequential(
+            nn.Linear(vision_dim, hidden_dim),
+            nn.Sigmoid()
+        )
+        self.text_gate = nn.Sequential(
+            nn.Linear(text_dim, hidden_dim),
+            nn.Sigmoid()
+        )
+        
+        # Feature projections
+        self.vision_proj = nn.Sequential(
+            nn.Linear(vision_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.text_proj = nn.Sequential(
+            nn.Linear(text_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        
+        self.output_dim = 2 * hidden_dim
+    
+    def forward(self, vision_feat: torch.Tensor, text_feat: torch.Tensor) -> torch.Tensor:
+        v_gate = self.vision_gate(vision_feat)
+        t_gate = self.text_gate(text_feat)
+        
+        v_proj = self.vision_proj(vision_feat)
+        t_proj = self.text_proj(text_feat)
+        
+        # Cross-gating
+        v_gated = t_gate * v_proj
+        t_gated = v_gate * t_proj
+        
+        return torch.cat([t_gated, v_gated], dim=-1)
+
+
+class BidirectionalCrossAttention(nn.Module):
+    """
+    Bidirectional cross-attention fusion.
+    Adapts to asymmetric dimensions.
+    """
+    
+    def __init__(self, vision_dim: int, text_dim: int,
+                 hidden_dim: int = 512, num_heads: int = 8, dropout: float = 0.1):
+        super().__init__()
+        
+        # Project to common space
+        self.vision_proj = nn.Linear(vision_dim, hidden_dim)
+        self.text_proj = nn.Linear(text_dim, hidden_dim)
+        
+        # Cross-attention modules
+        self.t2v_attn = nn.MultiheadAttention(
+            hidden_dim, num_heads, dropout=dropout, batch_first=True)
+        self.v2t_attn = nn.MultiheadAttention(
+            hidden_dim, num_heads, dropout=dropout, batch_first=True)
+        
+        # Layer norms
+        self.t2v_norm = nn.LayerNorm(hidden_dim)
+        self.v2t_norm = nn.LayerNorm(hidden_dim)
+        
+        # Output projections (asymmetric for parameter efficiency)
+        self.t2v_out = nn.Linear(hidden_dim, hidden_dim)  # 512
+        self.v2t_out = nn.Linear(hidden_dim, hidden_dim - 128)  # 384
+        
+        # Global projections from original features
+        self.vision_global = nn.Linear(vision_dim, hidden_dim - 128)  # 384
+        self.text_global = nn.Linear(text_dim, hidden_dim)  # 512
+        
+        self.dropout = nn.Dropout(dropout)
+        
+        # 512 + 512 + 384 + 384 = 1792
+        self.output_dim = hidden_dim + hidden_dim + (hidden_dim - 128) + (hidden_dim - 128)
+    
+    def forward(self, vision_feat: torch.Tensor, text_feat: torch.Tensor) -> torch.Tensor:
+        # Project to common space
+        v = self.vision_proj(vision_feat).unsqueeze(1)
+        t = self.text_proj(text_feat).unsqueeze(1)
+        
+        # Text-to-vision attention
+        t2v, _ = self.t2v_attn(query=t, key=v, value=v)
+        t2v = self.t2v_norm(t + self.dropout(t2v))
+        t2v = self.t2v_out(t2v.squeeze(1))
+        
+        # Vision-to-text attention
+        v2t, _ = self.v2t_attn(query=v, key=t, value=t)
+        v2t = self.v2t_norm(v + self.dropout(v2t))
+        v2t = self.v2t_out(v2t.squeeze(1))
+        
+        # Global projections
+        t_global = self.text_global(text_feat)
+        v_global = self.vision_global(vision_feat)
+        
+        return torch.cat([t_global, t2v, v_global, v2t], dim=-1)
+
+
+def get_fusion_module(fusion_name: str, vision_dim: int, text_dim: int, 
+                      dropout: float = 0.3) -> nn.Module:
+    """Factory for fusion modules."""
+    if fusion_name == 'cca':
+        return CCAFusion(vision_dim, text_dim, projection_dim=512)
+    elif fusion_name == 'gated':
+        return GatedFusion(vision_dim, text_dim, hidden_dim=512, dropout=dropout)
+    elif fusion_name == 'cross_attention':
+        return BidirectionalCrossAttention(
+            vision_dim, text_dim, hidden_dim=512, num_heads=8, dropout=dropout)
+    else:
+        raise ValueError(f"Unknown fusion method: {fusion_name}")
+
+# =============================================================================
+# UNIFIED CLASSIFIER
+# =============================================================================
+
+class UnifiedClassifier(nn.Module):
+    """
+    Unified multimodal classifier supporting all encoder-fusion combinations.
+    """
+    
+    def __init__(self, encoder_name: str, fusion_name: str, num_classes: int,
+                 lora_rank: int = 16, lora_alpha: int = 32,
+                 lora_dropout: float = 0.4, clf_dropout: float = 0.3):
+        super().__init__()
+        
+        self.encoder_name = encoder_name
+        self.fusion_name = fusion_name
+        self.num_classes = num_classes
+        
+        config = ENCODER_CONFIGS[encoder_name]
+        self.vision_dim = config['vision_dim']
+        self.text_dim = config['text_dim']
+        
+        # Load backbone
+        self._load_backbone(encoder_name, config['model_name'])
+        
+        # Freeze backbone
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+        
+        # Apply LoRA
+        self._apply_lora(encoder_name, config['lora_targets'],
+                        lora_rank, lora_alpha, lora_dropout)
+        
+        # Initialize fusion
+        self.fusion = get_fusion_module(
+            fusion_name, self.vision_dim, self.text_dim, clf_dropout)
+        
+        # Classification head
+        fusion_dim = self.fusion.output_dim
+        self.classifier = nn.Sequential(
+            nn.Linear(fusion_dim, 512),
+            nn.LayerNorm(512),
+            nn.GELU(),
+            nn.Dropout(clf_dropout),
+            nn.Linear(512, num_classes),
+        )
+    
+    def _load_backbone(self, encoder_name: str, model_name: str):
+        """Load the appropriate backbone model."""
+        if encoder_name == 'clip':
+            self.backbone = CLIPModel.from_pretrained(model_name)
+        elif encoder_name == 'blip':
+            self.backbone = BlipModel.from_pretrained(model_name)
+        elif encoder_name == 'siglip':
+            self.backbone = SiglipModel.from_pretrained(model_name)
+        else:
+            raise ValueError(f"Unknown encoder: {encoder_name}")
+    
+    def _apply_lora(self, encoder_name: str, targets: List[str],
+                    rank: int, alpha: int, dropout: float):
+        """Apply LoRA to backbone."""
+        if encoder_name == 'clip':
+            self.backbone.vision_model, nv = apply_lora(
+                self.backbone.vision_model, targets, rank, alpha, dropout)
+            self.backbone.text_model, nt = apply_lora(
+                self.backbone.text_model, targets, rank, alpha, dropout)
+        elif encoder_name == 'blip':
+            self.backbone.vision_model, nv = apply_lora(
+                self.backbone.vision_model, targets, rank, alpha, dropout)
+            self.backbone.text_model, nt = apply_lora(
+                self.backbone.text_model, targets, rank, alpha, dropout)
+        elif encoder_name == 'siglip':
+            self.backbone.vision_model, nv = apply_lora(
+                self.backbone.vision_model, targets, rank, alpha, dropout)
+            self.backbone.text_model, nt = apply_lora(
+                self.backbone.text_model, targets, rank, alpha, dropout)
+    
+    def extract_features(self, images: torch.Tensor, 
+                         input_ids: torch.Tensor,
+                         attention_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Extract vision and text features from backbone."""
+        if self.encoder_name == 'clip':
+            v_out = self.backbone.vision_model(pixel_values=images)
+            t_out = self.backbone.text_model(input_ids=input_ids,
+                                             attention_mask=attention_mask)
+            v_feat = v_out.pooler_output
+            t_feat = t_out.pooler_output
+            
+        elif self.encoder_name == 'blip':
+            v_out = self.backbone.vision_model(pixel_values=images)
+            t_out = self.backbone.text_model(input_ids=input_ids,
+                                             attention_mask=attention_mask)
+            v_feat = v_out.pooler_output
+            t_feat = t_out.last_hidden_state[:, 0]  # CLS token
+            
+        elif self.encoder_name == 'siglip':
+            v_out = self.backbone.vision_model(pixel_values=images)
+            t_out = self.backbone.text_model(input_ids=input_ids,
+                                             attention_mask=attention_mask)
+            v_feat = v_out.pooler_output
+            t_feat = t_out.pooler_output
+            
+        return v_feat, t_feat
+    
+    def forward(self, images: torch.Tensor, input_ids: torch.Tensor,
+                attention_mask: torch.Tensor) -> torch.Tensor:
+        v_feat, t_feat = self.extract_features(images, input_ids, attention_mask)
+        fused = self.fusion(v_feat, t_feat)
+        return self.classifier(fused)
+    
+    def forward_with_cca_loss(self, images: torch.Tensor, input_ids: torch.Tensor,
+                               attention_mask: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
+        """Forward with CCA auxiliary loss (only for CCA fusion)."""
+        v_feat, t_feat = self.extract_features(images, input_ids, attention_mask)
+        fused = self.fusion(v_feat, t_feat)
+        logits = self.classifier(fused)
+        
+        if self.fusion_name == 'cca':
+            cca_losses = self.fusion.compute_cca_loss(v_feat, t_feat)
+        else:
+            cca_losses = {'loss_aux': torch.tensor(0.0, device=logits.device)}
+        
+        return logits, cca_losses
+    
+    def lora_params(self) -> List[nn.Parameter]:
+        """Get LoRA parameters."""
+        return [p for n, p in self.named_parameters() if 'lora_' in n]
+    
+    def head_params(self) -> List[nn.Parameter]:
+        """Get fusion + classifier parameters."""
+        return list(self.fusion.parameters()) + list(self.classifier.parameters())
+
+# =============================================================================
+# TRAINING & EVALUATION
+# =============================================================================
+
+def train_epoch(model: nn.Module, loader: DataLoader, optimizer: torch.optim.Optimizer,
+                loss_fn: nn.Module, device: torch.device, scaler: GradScaler,
+                fusion_name: str, cca_weight: float = 0.1, accum: int = 2) -> Dict:
+    """Train for one epoch."""
+    model.train()
+    total_loss = 0.0
+    total_cca_loss = 0.0
+    all_preds, all_labels = [], []
+    optimizer.zero_grad()
+    
+    for i, batch in enumerate(loader):
+        imgs = batch['image'].to(device)
+        ids = batch['input_ids'].to(device)
+        mask = batch['attention_mask'].to(device)
+        lbl = batch['label'].to(device)
+        
+        with autocast():
+            if fusion_name == 'cca':
+                logits, cca_losses = model.forward_with_cca_loss(imgs, ids, mask)
+                loss_task = loss_fn(logits, lbl)
+                loss_cca = cca_losses['loss_aux']
+                loss = (loss_task + cca_weight * loss_cca) / accum
+                total_cca_loss += loss_cca.item()
+            else:
+                logits = model(imgs, ids, mask)
+                loss = loss_fn(logits, lbl) / accum
+        
+        scaler.scale(loss).backward()
+        
+        if (i + 1) % accum == 0:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+        
+        total_loss += loss.item() * accum
+        preds = logits.argmax(-1).cpu().numpy()
+        all_preds.extend(preds)
+        all_labels.extend(lbl.cpu().numpy())
+    
+    p, l = np.array(all_preds), np.array(all_labels)
+    return {
+        'loss': total_loss / len(loader),
+        'cca_loss': total_cca_loss / len(loader) if fusion_name == 'cca' else 0.0,
+        'acc': accuracy_score(l, p),
+        'macro_f1': f1_score(l, p, average='macro', zero_division=0),
+        'weighted_f1': f1_score(l, p, average='weighted', zero_division=0),
+    }
+
+
+@torch.no_grad()
+def evaluate(model: nn.Module, loader: DataLoader, loss_fn: nn.Module,
+             device: torch.device) -> Dict:
+    """Evaluate model."""
+    model.eval()
+    total_loss = 0.0
+    all_preds, all_labels = [], []
+    
+    for batch in loader:
+        imgs = batch['image'].to(device)
+        ids = batch['input_ids'].to(device)
+        mask = batch['attention_mask'].to(device)
+        lbl = batch['label'].to(device)
+        
+        with autocast():
+            logits = model(imgs, ids, mask)
+            loss = loss_fn(logits, lbl)
+        
+        total_loss += loss.item()
+        preds = logits.argmax(-1).cpu().numpy()
+        all_preds.extend(preds)
+        all_labels.extend(lbl.cpu().numpy())
+    
+    p, l = np.array(all_preds), np.array(all_labels)
+    return {
+        'loss': total_loss / len(loader),
+        'acc': accuracy_score(l, p),
+        'macro_f1': f1_score(l, p, average='macro', zero_division=0),
+        'weighted_f1': f1_score(l, p, average='weighted', zero_division=0),
+    }
+
+# =============================================================================
+# PRE-FLIGHT SANITY CHECK
+# =============================================================================
+
+def preflight_check():
+    """
+    Run each (encoder, fusion) combination on 5 dummy samples.
+    Catches dimension mismatches, LoRA errors, etc. before full training.
+    """
+    print("=" * 70)
+    print("PHASE 0: PRE-FLIGHT SANITY CHECK")
+    print("=" * 70)
+    
+    task_name = 'informativeness'
+    num_classes = len(TASKS[task_name]['label_map'])
+    
+    all_passed = True
+    
+    for encoder_name in ['clip', 'blip', 'siglip']:
+        print(f"\n  Testing {encoder_name.upper()}...")
+        config = ENCODER_CONFIGS[encoder_name]
+        
+        for fusion_name in FUSION_METHODS:
+            try:
+                # Build model
+                model = UnifiedClassifier(
+                    encoder_name=encoder_name,
+                    fusion_name=fusion_name,
+                    num_classes=num_classes,
+                    lora_rank=8,
+                    lora_alpha=16,
+                    lora_dropout=0.3,
+                    clf_dropout=0.3,
+                ).to(DEVICE)
+                
+                # Dummy inputs
+                B = 5
+                dummy_imgs = torch.randn(B, 3, 224, 224).to(DEVICE)
+                dummy_ids = torch.randint(0, 1000, (B, config['max_length'])).to(DEVICE)
+                dummy_mask = torch.ones(B, config['max_length']).long().to(DEVICE)
+                
+                # Forward pass
+                with torch.no_grad():
+                    with autocast():
+                        if fusion_name == 'cca':
+                            logits, cca_losses = model.forward_with_cca_loss(
+                                dummy_imgs, dummy_ids, dummy_mask)
+                        else:
+                            logits = model(dummy_imgs, dummy_ids, dummy_mask)
+                
+                # Verify output shape
+                assert logits.shape == (B, num_classes), \
+                    f"Expected {(B, num_classes)}, got {logits.shape}"
+                
+                # Count parameters
+                trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                total = sum(p.numel() for p in model.parameters())
+                
+                print(f"    ✓ {fusion_name:16s}: PASSED  "
+                      f"(trainable: {trainable:,} / {total:,} = {100*trainable/total:.2f}%)")
+                
+                del model
+                cleanup()
+                
+            except Exception as e:
+                print(f"    ✗ {fusion_name:16s}: FAILED")
+                print(f"      Error: {e}")
+                all_passed = False
+        
+        cleanup_aggressive()
+    
+    if not all_passed:
+        print("\n" + "=" * 70)
+        print("PRE-FLIGHT CHECK FAILED. Fix errors before proceeding.")
+        print("=" * 70)
+        sys.exit(1)
+    
+    print("\n" + "=" * 70)
+    print("✓ All 9 configurations passed pre-flight check.")
+    print("=" * 70 + "\n")
+
+# =============================================================================
+# MAIN EXPERIMENT LOOP
+# =============================================================================
+
+def run_experiments():
+    """
+    Main experiment loop.
+    3 tasks × 3 encoders × 3 fusions × 5 seeds × 5 HP configs = 675 training runs
+    """
+    
+    # Initialize results storage
+    all_results = []
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_file = os.path.join(RESULTS_DIR, f"results_{timestamp}.csv")
+    
+    total_seeds = len(SEEDS)
+    total_tasks = len(TASKS)
+    total_encoders = len(ENCODER_CONFIGS)
+    total_fusions = len(FUSION_METHODS)
+    total_hp = len(HP_CONFIGS)
+    
+    total_experiments = total_seeds * total_tasks * total_encoders * total_fusions
+    total_runs = total_experiments * total_hp
+    
+    print("=" * 70)
+    print("EXPERIMENT CONFIGURATION")
+    print("=" * 70)
+    print(f"  Seeds:          {total_seeds} ({SEEDS})")
+    print(f"  Tasks:          {total_tasks} ({list(TASKS.keys())})")
+    print(f"  Encoders:       {total_encoders} ({list(ENCODER_CONFIGS.keys())})")
+    print(f"  Fusion Methods: {total_fusions} ({FUSION_METHODS})")
+    print(f"  HP Configs:     {total_hp}")
+    print(f"  Total Experiments: {total_experiments}")
+    print(f"  Total Training Runs: {total_runs}")
+    print("=" * 70 + "\n")
+    
+    experiment_idx = 0
+    
+    # ── MAIN LOOP ────────────────────────────────────────────────────────────
+    for seed in SEEDS:
+        print(f"\n{'#'*70}")
+        print(f"# SEED: {seed}")
+        print(f"{'#'*70}")
+        
+        set_seed(seed)
+        
+        for task_name in TASKS.keys():
+            num_classes = len(TASKS[task_name]['label_map'])
+            
+            print(f"\n{'='*60}")
+            print(f"  TASK: {task_name.upper()} ({num_classes} classes) | SEED: {seed}")
+            print(f"{'='*60}")
+            
+            for encoder_name in ENCODER_CONFIGS.keys():
+                print(f"\n  ── ENCODER: {encoder_name.upper()} ──")
+                
+                # Load data for this encoder
+                loaders, train_ds, num_classes = make_loaders(
+                    task_name, encoder_name, BATCH_SIZE)
+                
+                print(f"     Data: train={len(loaders['train'].dataset)}, "
+                      f"val={len(loaders['val'].dataset)}, "
+                      f"test={len(loaders['test'].dataset)}")
+                
+                # Build loss function
+                loss_fn = build_loss_fn(task_name, train_ds, num_classes)
+                
+                for fusion_name in FUSION_METHODS:
+                    experiment_idx += 1
+                    
+                    print(f"\n     ┌─ FUSION: {fusion_name.upper()} "
+                          f"[Exp {experiment_idx}/{total_experiments}]")
+                    
+                    best_trial = {
+                        'val_f1': -1,
+                        'hp_config': None,
+                        'state': None,
+                        'hp_idx': -1,
+                    }
+                    
+                    # ── HYPERPARAMETER SEARCH ────────────────────────────────
+                    for hp_idx, hp_config in enumerate(HP_CONFIGS):
+                        print(f"     │  Trial {hp_idx+1}/{total_hp}: "
+                              f"rank={hp_config['lora_rank']}, "
+                              f"α={hp_config['lora_alpha']}, "
+                              f"drop={hp_config['lora_dropout']:.2f}")
+                        
+                        try:
+                            # Build model
+                            model = UnifiedClassifier(
+                                encoder_name=encoder_name,
+                                fusion_name=fusion_name,
+                                num_classes=num_classes,
+                                lora_rank=hp_config['lora_rank'],
+                                lora_alpha=hp_config['lora_alpha'],
+                                lora_dropout=hp_config['lora_dropout'],
+                                clf_dropout=hp_config['lora_dropout'],
+                            ).to(DEVICE)
+                            
+                            # Optimizer
+                            optimizer = AdamW([
+                                {'params': model.head_params(), 
+                                 'lr': hp_config['head_lr']},
+                                {'params': model.lora_params(), 
+                                 'lr': hp_config['backbone_lr']},
+                            ], weight_decay=0.01)
+                            
+                            scheduler = ReduceLROnPlateau(
+                                optimizer, mode='max', factor=0.5, patience=1)
+                            scaler = GradScaler()
+                            
+                            # Training loop
+                            trial_best_val_f1 = -1
+                            trial_best_state = None
+                            no_improve = 0
+                            
+                            for epoch in range(EPOCHS_PER_TRIAL):
+                                tr = train_epoch(
+                                    model, loaders['train'], optimizer, loss_fn,
+                                    DEVICE, scaler, fusion_name, CCA_WEIGHT, GRAD_ACCUM)
+                                
+                                va = evaluate(model, loaders['val'], loss_fn, DEVICE)
+                                
+                                scheduler.step(va['weighted_f1'])
+                                
+                                if va['weighted_f1'] > trial_best_val_f1:
+                                    trial_best_val_f1 = va['weighted_f1']
+                                    trial_best_state = {
+                                        k: v.cpu().clone() 
+                                        for k, v in model.state_dict().items()
+                                    }
+                                    no_improve = 0
+                                else:
+                                    no_improve += 1
+                                    if no_improve >= PATIENCE:
+                                        break
+                            
+                            print(f"     │    → val_f1={trial_best_val_f1:.4f} "
+                                  f"(epochs: {epoch+1})")
+                            
+                            # Update best trial
+                            if trial_best_val_f1 > best_trial['val_f1']:
+                                best_trial = {
+                                    'val_f1': trial_best_val_f1,
+                                    'hp_config': hp_config,
+                                    'state': trial_best_state,
+                                    'hp_idx': hp_idx,
+                                }
+                            
+                            del model, optimizer, scheduler, scaler
+                            cleanup()
+                            
+                        except Exception as e:
+                            print(f"     │    ✗ Trial failed: {e}")
+                            cleanup()
+                            continue
+                    
+                    # ── EVALUATE BEST TRIAL ON TEST SET ──────────────────────
+                    if best_trial['state'] is not None:
+                        hp = best_trial['hp_config']
+                        print(f"     │")
+                        print(f"     │  ★ Best: Trial {best_trial['hp_idx']+1} "
+                              f"(rank={hp['lora_rank']}, val_f1={best_trial['val_f1']:.4f})")
+                        
+                        # Rebuild best model
+                        model = UnifiedClassifier(
+                            encoder_name=encoder_name,
+                            fusion_name=fusion_name,
+                            num_classes=num_classes,
+                            lora_rank=hp['lora_rank'],
+                            lora_alpha=hp['lora_alpha'],
+                            lora_dropout=hp['lora_dropout'],
+                            clf_dropout=hp['lora_dropout'],
+                        ).to(DEVICE)
+                        
+                        model.load_state_dict(best_trial['state'])
+                        
+                        # Test evaluation
+                        test_metrics = evaluate(model, loaders['test'], loss_fn, DEVICE)
+                        
+                        print(f"     └─ TEST: acc={test_metrics['acc']:.4f}, "
+                              f"macro_f1={test_metrics['macro_f1']:.4f}, "
+                              f"weighted_f1={test_metrics['weighted_f1']:.4f}")
+                        
+                        # Store results
+                        result = {
+                            'seed': seed,
+                            'task': task_name,
+                            'encoder': encoder_name,
+                            'fusion': fusion_name,
+                            'num_classes': num_classes,
+                            'best_hp_idx': best_trial['hp_idx'],
+                            'lora_rank': hp['lora_rank'],
+                            'lora_alpha': hp['lora_alpha'],
+                            'lora_dropout': hp['lora_dropout'],
+                            'backbone_lr': hp['backbone_lr'],
+                            'head_lr': hp['head_lr'],
+                            'val_f1': best_trial['val_f1'],
+                            'test_acc': test_metrics['acc'],
+                            'test_macro_f1': test_metrics['macro_f1'],
+                            'test_weighted_f1': test_metrics['weighted_f1'],
+                            'test_loss': test_metrics['loss'],
+                        }
+                        all_results.append(result)
+                        
+                        # Save intermediate results
+                        pd.DataFrame(all_results).to_csv(results_file, index=False)
+                        
+                        del model
+                        cleanup()
+                    else:
+                        print(f"     └─ No valid trial completed")
+                
+                # Cleanup after encoder
+                del loaders, train_ds, loss_fn
+                cleanup_aggressive()
+    
+    return all_results, results_file
+
+
+def generate_summary(results: List[Dict], results_file: str):
+    """Generate summary statistics and tables."""
+    
+    df = pd.DataFrame(results)
+    
+    print("\n\n" + "=" * 90)
+    print("FINAL RESULTS SUMMARY")
+    print("=" * 90)
+    
+    # ── Per-configuration summary (mean ± std across seeds) ─────────────────
+    print("\n" + "-" * 90)
+    print("AGGREGATED RESULTS (Mean ± Std across 5 seeds)")
+    print("-" * 90)
+    
+    summary_rows = []
+    
+    for task in TASKS.keys():
+        for encoder in ENCODER_CONFIGS.keys():
+            for fusion in FUSION_METHODS:
+                subset = df[(df['task'] == task) & 
+                           (df['encoder'] == encoder) & 
+                           (df['fusion'] == fusion)]
+                
+                if len(subset) > 0:
+                    row = {
+                        'task': task,
+                        'encoder': encoder,
+                        'fusion': fusion,
+                        'acc_mean': subset['test_acc'].mean(),
+                        'acc_std': subset['test_acc'].std(),
+                        'macro_f1_mean': subset['test_macro_f1'].mean(),
+                        'macro_f1_std': subset['test_macro_f1'].std(),
+                        'weighted_f1_mean': subset['test_weighted_f1'].mean(),
+                        'weighted_f1_std': subset['test_weighted_f1'].std(),
+                        'n_runs': len(subset),
+                    }
+                    summary_rows.append(row)
+    
+    summary_df = pd.DataFrame(summary_rows)
+    
+    # Print formatted table
+    print(f"\n{'Task':<18} {'Encoder':<10} {'Fusion':<16} "
+          f"{'Accuracy':>18} {'Macro F1':>18} {'Weighted F1':>18}")
+    print("-" * 100)
+    
+    for _, row in summary_df.iterrows():
+        print(f"{row['task']:<18} {row['encoder']:<10} {row['fusion']:<16} "
+              f"{row['acc_mean']:.4f} ± {row['acc_std']:.4f}   "
+              f"{row['macro_f1_mean']:.4f} ± {row['macro_f1_std']:.4f}   "
+              f"{row['weighted_f1_mean']:.4f} ± {row['weighted_f1_std']:.4f}")
+    
+    # ── Best configuration per task ─────────────────────────────────────────
+    print("\n" + "-" * 90)
+    print("BEST CONFIGURATION PER TASK (by Weighted F1)")
+    print("-" * 90)
+    
+    for task in TASKS.keys():
+        task_df = summary_df[summary_df['task'] == task]
+        if len(task_df) > 0:
+            best_idx = task_df['weighted_f1_mean'].idxmax()
+            best = task_df.loc[best_idx]
+            print(f"\n  {task.upper()}:")
+            print(f"    Best: {best['encoder']} + {best['fusion']}")
+            print(f"    Accuracy:    {best['acc_mean']:.4f} ± {best['acc_std']:.4f}")
+            print(f"    Macro F1:    {best['macro_f1_mean']:.4f} ± {best['macro_f1_std']:.4f}")
+            print(f"    Weighted F1: {best['weighted_f1_mean']:.4f} ± {best['weighted_f1_std']:.4f}")
+    
+    # ── Average across all tasks ────────────────────────────────────────────
+    print("\n" + "-" * 90)
+    print("AVERAGE ACROSS ALL TASKS")
+    print("-" * 90)
+    
+    avg_rows = []
+    for encoder in ENCODER_CONFIGS.keys():
+        for fusion in FUSION_METHODS:
+            subset = summary_df[(summary_df['encoder'] == encoder) & 
+                               (summary_df['fusion'] == fusion)]
+            if len(subset) > 0:
+                avg_rows.append({
+                    'encoder': encoder,
+                    'fusion': fusion,
+                    'acc': subset['acc_mean'].mean(),
+                    'macro_f1': subset['macro_f1_mean'].mean(),
+                    'weighted_f1': subset['weighted_f1_mean'].mean(),
+                })
+    
+    avg_df = pd.DataFrame(avg_rows)
+    
+    print(f"\n{'Encoder':<10} {'Fusion':<16} {'Acc':>10} {'Macro F1':>12} {'Weighted F1':>14}")
+    print("-" * 65)
+    for _, row in avg_df.iterrows():
+        print(f"{row['encoder']:<10} {row['fusion']:<16} "
+              f"{row['acc']:>10.4f} {row['macro_f1']:>12.4f} {row['weighted_f1']:>14.4f}")
+    
+    # ── Save summary ────────────────────────────────────────────────────────
+    summary_file = results_file.replace('.csv', '_summary.csv')
+    summary_df.to_csv(summary_file, index=False)
+    print(f"\n\nResults saved to:")
+    print(f"  Raw:     {results_file}")
+    print(f"  Summary: {summary_file}")
+    
+    print("\n" + "=" * 90 + "\n")
+    
+    return summary_df
+
+# =============================================================================
+# MAIN ENTRY POINT
+# =============================================================================
+
+def main():
+    """Main entry point."""
+    
+    print("\n" + "=" * 70)
+    print(" UNIFIED MULTIMODAL DISASTER CLASSIFICATION PIPELINE")
+    print(" 3 Encoders × 3 Fusion Methods × 3 Tasks × 5 Seeds × 5 HP Configs")
+    print("=" * 70 + "\n")
+    
+    # Phase 0: Pre-flight check
+    preflight_check()
+    
+    # Phase 1: Run all experiments
+    results, results_file = run_experiments()
+    
+    # Phase 2: Generate summary
+    if len(results) > 0:
+        summary_df = generate_summary(results, results_file)
+    else:
+        print("No results to summarize.")
+    
+    print("Experiment completed successfully!")
+
+
+if __name__ == "__main__":
+    main()
