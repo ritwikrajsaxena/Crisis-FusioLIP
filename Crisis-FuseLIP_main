@@ -1,9 +1,4 @@
-# =============================================================================
-# UNIFIED MULTIMODAL DISASTER CLASSIFICATION PIPELINE
-# 3 Encoders × 3 Fusion Methods × 3 Tasks × 5 Seeds × 5 HP Configs = 675 Runs
-# =============================================================================
 
-# ── IMPORTS ──────────────────────────────────────────────────────────────────
 import gc
 import os
 import sys
@@ -174,9 +169,9 @@ def get_device():
 
 DEVICE = get_device()
 
-# =============================================================================
+
 # DATASET
-# =============================================================================
+
 
 class CrisisMMDDataset(Dataset):
     """Unified dataset for all encoders."""
@@ -315,9 +310,9 @@ def make_loaders(task_name: str, encoder_name: str, batch_size: int = 16):
     
     return loaders, datasets['train'], num_classes
 
-# =============================================================================
+
 # LOSS FUNCTIONS
-# =============================================================================
+
 
 class FocalLoss(nn.Module):
     """Focal loss for imbalanced classification (humanitarian task)."""
@@ -372,9 +367,9 @@ def build_loss_fn(task_name: str, train_dataset, num_classes: int):
     else:
         return WeightedCE(weight=class_weights)
 
-# =============================================================================
-# LORA IMPLEMENTATION
-# =============================================================================
+
+# LORA 
+
 
 class LoRALayer(nn.Module):
     """Low-Rank Adaptation layer."""
@@ -440,9 +435,7 @@ def apply_lora(model: nn.Module, targets: List[str],
             count += 1
     return model, count
 
-# =============================================================================
-# FUSION METHODS
-# =============================================================================
+# FUSION 
 
 class CCAFusion(nn.Module):
     """
@@ -644,9 +637,9 @@ def get_fusion_module(fusion_name: str, vision_dim: int, text_dim: int,
     else:
         raise ValueError(f"Unknown fusion method: {fusion_name}")
 
-# =============================================================================
-# UNIFIED CLASSIFIER
-# =============================================================================
+
+# CLASSIFIER
+
 
 class UnifiedClassifier(nn.Module):
     """
@@ -776,9 +769,9 @@ class UnifiedClassifier(nn.Module):
         """Get fusion + classifier parameters."""
         return list(self.fusion.parameters()) + list(self.classifier.parameters())
 
-# =============================================================================
+
 # TRAINING & EVALUATION
-# =============================================================================
+
 
 def train_epoch(model: nn.Module, loader: DataLoader, optimizer: torch.optim.Optimizer,
                 loss_fn: nn.Module, device: torch.device, scaler: GradScaler,
@@ -860,9 +853,7 @@ def evaluate(model: nn.Module, loader: DataLoader, loss_fn: nn.Module,
         'weighted_f1': f1_score(l, p, average='weighted', zero_division=0),
     }
 
-# =============================================================================
-# PRE-FLIGHT SANITY CHECK
-# =============================================================================
+# Sample run
 
 def preflight_check():
     """
@@ -941,9 +932,9 @@ def preflight_check():
     print("✓ All 9 configurations passed pre-flight check.")
     print("=" * 70 + "\n")
 
-# =============================================================================
-# MAIN EXPERIMENT LOOP
-# =============================================================================
+
+# EXPERIMENT LOOP
+
 
 def run_experiments():
     """
@@ -1202,7 +1193,7 @@ def generate_summary(results: List[Dict], results_file: str):
     
     summary_df = pd.DataFrame(summary_rows)
     
-    # Print formatted table
+    # Print  table
     print(f"\n{'Task':<18} {'Encoder':<10} {'Fusion':<16} "
           f"{'Accuracy':>18} {'Macro F1':>18} {'Weighted F1':>18}")
     print("-" * 100)
@@ -1267,9 +1258,9 @@ def generate_summary(results: List[Dict], results_file: str):
     
     return summary_df
 
-# =============================================================================
-# MAIN ENTRY POINT
-# =============================================================================
+
+# MAIN
+
 
 def main():
     """Main entry point."""
