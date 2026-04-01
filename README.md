@@ -1,4 +1,4 @@
-Here’s a version that renders correctly on GitHub:
+
 
 Expected Directory Structure
 CrisisMMD_v2.0/
