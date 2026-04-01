@@ -1,8 +1,8 @@
 
 
-The pipeline executes a large-scale ablation study consisting of 675 experimental runs (3 Encoders × 3 Fusions × 3 Tasks × 5 Seeds × 5 Hyperparameter Configs) to identify the optimal multimodal architecture for crisis response.
+The pipeline executes a large-scale multimodal architecture for crisis response.
 
-🛠️ Requirements
+Requirements
 Python 3.9+
 CUDA-enabled GPU (16GB+ VRAM recommended)
 Dependencies: torch, torchvision, transformers, pandas, scikit-learn, pillow, tqdm, accelerate
@@ -15,11 +15,11 @@ Efficient Tuning: Uses LoRA (Low-Rank Adaptation) to train models with minimal V
 Advanced Fusion: Implements Canonical Correlation Analysis (CCA), Gated Cross-Modal attention, and Bidirectional Cross-Attention.
 Imbalance Handling: Utilizes Focal Loss and Class-Weighted Cross-Entropy for skewed disaster data.
 Robustness: 5-seed statistical validation with automated hyperparameter search.
-🏃 Execution
+Execution
 Bash
 
-python unified_pipeline.py
-The script performs a "Pre-flight Check" to validate model dimensions before initiating the full training loop.
+python Crisis-FusioLIP_main.py
+
 
 
 
