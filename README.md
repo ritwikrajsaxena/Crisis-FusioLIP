@@ -4,9 +4,6 @@
 
 
 
-Expected Directory Structure
-
-
 /path/to/your/CrisisMMD_v2.0/
 ├── crisismmd_datasplit_with_LLaVA_generated_text/
 │   ├── task_informative_text_img_train.tsv
@@ -18,8 +15,8 @@ Expected Directory Structure
 │   ├── task_damage_text_img_train.tsv
 │   ├── task_damage_text_img_dev.tsv
 │   └── task_damage_text_img_test.tsv
-├── <image_folders>/  # Referenced by 'image' column in TSVs
+├── <image_folders>/  # Contains images referenced by the 'image' column in TSV files
 │   └── *.jpg / *.png
-└── experiment_results/  # Created automatically
-    ├── results_20250101_120000.csv
-    └── results_20250101_120000_summary.csv
+└── experiment_results/  # Generated automatically after running experiments
+    ├── results_YYYYMMDD_HHMMSS.csv
+    └── results_YYYYMMDD_HHMMSS_summary.csv
