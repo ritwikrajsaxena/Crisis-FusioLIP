@@ -18,8 +18,8 @@ The pipeline executes a multimodal architecture for crisis response.
 - Execution
   - python Crisis-FusioLIP_main.py
 
-Link to Dataset: https://crisisnlp.qcri.org/crisismmd.html
-LLaVA Captions available here: https://drive.google.com/file/d/1xpYcshz9_KkQqw3tN9E86Df7UgmN6BaY/view?usp=sharing
+- Link to Dataset: https://crisisnlp.qcri.org/crisismmd.html
+- LLaVA Captions available here: https://drive.google.com/file/d/1xpYcshz9_KkQqw3tN9E86Df7UgmN6BaY/view?usp=sharing
 
 
 
