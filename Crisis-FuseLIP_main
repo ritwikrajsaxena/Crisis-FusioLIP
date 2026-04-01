@@ -39,7 +39,7 @@ transformers.logging.set_verbosity_error()
 # =============================================================================
 
 # ── Paths ────────────────────────────────────────────────────────────────────
-BASE_DIR = "/home/rsnfh/Downloads/CrisisMMD_v2.0"
+BASE_DIR = ""
 SPLITS_DIR = os.path.join(BASE_DIR, "crisismmd_datasplit_with_LLaVA_generated_text")
 RESULTS_DIR = os.path.join(BASE_DIR, "experiment_results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
