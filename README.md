@@ -15,8 +15,8 @@ Efficient Tuning: Uses LoRA (Low-Rank Adaptation) to train models with minimal V
 Advanced Fusion: Implements Canonical Correlation Analysis (CCA), Gated Cross-Modal attention, and Bidirectional Cross-Attention.
 Imbalance Handling: Utilizes Focal Loss and Class-Weighted Cross-Entropy for skewed disaster data.
 Robustness: 5-seed statistical validation with automated hyperparameter search.
-Execution
-Bash
+- Execution
+  - Bash
 
 python Crisis-FusioLIP_main.py
 
