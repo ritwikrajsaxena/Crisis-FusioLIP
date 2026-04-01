@@ -19,6 +19,7 @@ The pipeline executes a multimodal architecture for crisis response.
   - python Crisis-FusioLIP_main.py
 
 
+LLaVA Captions avalabe here: https://drive.google.com/file/d/1xpYcshz9_KkQqw3tN9E86Df7UgmN6BaY/view?usp=sharing
 
 
 
