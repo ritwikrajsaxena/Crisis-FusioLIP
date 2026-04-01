@@ -3,7 +3,7 @@ The pipeline executes a multimodal architecture for crisis response.
 
 - Requirements
   - Python 3.9 or higher
-  - CUDA-enabled GPU (16GB+ VRAM recommended)
+  - CUDA-enabled GPU 
   - Dependencies: torch, torchvision, transformers, pandas, scikit-learn, pillow, tqdm, accelerate
 - Dataset Setup
   - Download CrisisMMD v2.0.
