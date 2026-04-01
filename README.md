@@ -2,23 +2,21 @@
 The pipeline executes a multimodal architecture for crisis response.
 
 Requirements
-  Python 3.9 or higher
-  CUDA-enabled GPU (16GB+ VRAM recommended)
-  Dependencies: torch, torchvision, transformers, pandas, scikit-learn, pillow, tqdm, accelerate
+  - Python 3.9 or higher
+  - CUDA-enabled GPU (16GB+ VRAM recommended)
+  - Dependencies: torch, torchvision, transformers, pandas, scikit-learn, pillow, tqdm, accelerate
 Dataset Setup
-  Download CrisisMMD v2.0.
-  Update BASE_DIR in the script to point to your local dataset path.
-  Ensure your TSV splits include tweet_text and LLaVA_text for multimodal input.
+  - Download CrisisMMD v2.0.
+  - Update BASE_DIR in the script to point to your local dataset path.
+  - Ensure your TSV splits include tweet_text and LLaVA_text for multimodal input.
 Key Features
-  Uses Low-Rank Adaptation (LoRA) to train models with minimal VRAM.
-  Implements Canonical Correlation Analysis (CCA), Gated Cross-Modal Attention, and Bidirectional Cross-Attention.
-  Uses Focal Loss and Class-Weighted Cross-Entropy for skewed disaster data.
-  5-seed statistical validation with automated hyperparameter search.
+  - Uses Low-Rank Adaptation (LoRA) to train models with minimal VRAM.
+  - Implements Canonical Correlation Analysis (CCA), Gated Cross-Modal Attention, and Bidirectional Cross-Attention.
+  - Uses Focal Loss and Class-Weighted Cross-Entropy for skewed disaster data.
+  - 5-seed statistical validation with automated hyperparameter search.
+
 Execution
-
-Run the pipeline using:
-
-python Crisis-FusioLIP_main.py
+  - python Crisis-FusioLIP_main.py
 
 
 
